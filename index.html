@@ -13,6 +13,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- SheetJS for native Excel (.xlsx / .xls) parsing -->
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
     <!-- Google Fonts: Inter -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -631,8 +633,8 @@
                                         <i data-lucide="upload-cloud" class="w-6 h-6"></i>
                                     </div>
                                     <span class="text-xs sm:text-sm font-bold text-white">Нажмите или перетащите файл выписки</span>
-                                    <span class="text-[11px] text-slate-400 mt-1">.CSV, .TXT, .TSV</span>
-                                    <input type="file" accept=".csv,.txt,.tsv" onchange="window.app.handleStatementFileUpload(event)" class="hidden">
+                                    <span class="text-[11px] text-emerald-400 font-semibold mt-1">.XLSX, .XLS (Excel Приват24 / Ощад), .CSV, .TXT</span>
+                                    <input type="file" accept=".xlsx,.xls,.csv,.txt,.tsv" onchange="window.app.handleStatementFileUpload(event)" class="hidden">
                                 </label>
                             </div>
                         </div>
@@ -964,6 +966,21 @@
                                     Подключить код
                                 </button>
                             </div>
+
+                            <!-- Explicit Manual Push / Pull Controls -->
+                            <div class="pt-3 border-t border-white/10 space-y-2">
+                                <p class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Ручное управление синхронизацией</p>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                    <button onclick="window.app.manualForcePush()" class="py-2.5 px-3.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-xs font-bold text-emerald-300 flex items-center justify-center gap-2 transition">
+                                        <i data-lucide="cloud-upload" class="w-4 h-4"></i>
+                                        <span>⬆️ Отправить с этого устройства в облако</span>
+                                    </button>
+                                    <button onclick="window.app.manualForcePull()" class="py-2.5 px-3.5 rounded-xl bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-xs font-bold text-indigo-300 flex items-center justify-center gap-2 transition">
+                                        <i data-lucide="cloud-download" class="w-4 h-4"></i>
+                                        <span>⬇️ Загрузить из облака сюда</span>
+                                    </button>
+                                </div>
+                            </div>
                         </div>
 
                         <!-- Data Management: Clear to 0 / Backup (5 cols) -->
@@ -1252,7 +1269,7 @@
                         oschad: 0
                     },
                     transactions: [],
-                    updatedAt: Date.now()
+                    updatedAt: 0
                 };
             }
 
@@ -1269,7 +1286,7 @@
                                     oschad: Number(parsed.balances.oschad) || 0
                                 },
                                 transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
-                                updatedAt: Number(parsed.updatedAt) || Date.now()
+                                updatedAt: Number(parsed.updatedAt) || 0
                             };
                         }
                     }
@@ -1305,78 +1322,208 @@
                 this.switchTab('dashboard');
                 this.renderAll();
 
-                // Pull latest state from cloud immediately on open (solves iPhone -> PC sync on GitHub Pages)
+                // Smart Sync on startup: pulls if cloud is newer, pushes if local is newer
                 await this.forceCloudPull(false);
                 this.startRealtimeCloudListener();
             }
 
-            // Pull latest state snapshot from ntfy.sh cached JSON stream (works on GitHub Pages without API keys)
-            async forceCloudPull(showNotification = false) {
+            // Fetch and reconstruct latest state from ntfy.sh (supports multi-chunk payloads > 4KB & attachments)
+            async fetchLatestCloudState() {
                 const topic = this.getCloudTopicName();
-                this.setSyncIndicator('syncing');
-                try {
-                    const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=all`, {
-                        cache: 'no-store'
-                    });
-                    if (!res.ok) throw new Error('Cloud fetch status ' + res.status);
-                    const text = await res.text();
-                    const lines = text.trim().split('\n').filter(Boolean);
+                const res = await fetch(`https://ntfy.sh/${topic}/json?poll=1&since=all`, {
+                    cache: 'no-store'
+                });
+                if (!res.ok) throw new Error('Cloud fetch status ' + res.status);
+                const text = await res.text();
+                const lines = text.trim().split('\n').filter(Boolean);
 
-                    let latestPayload = null;
-                    for (const line of lines) {
+                const chunkGroups = {};
+                let latestSinglePayload = null;
+                const attachmentMessages = [];
+
+                for (const line of lines) {
+                    try {
+                        const msg = JSON.parse(line);
+                        if (msg.event !== 'message') continue;
+
+                        if (msg.message) {
+                            const data = JSON.parse(msg.message);
+                            // Multi-chunk format: { _ft: 1, sid, u, i, n, d }
+                            if (data && data._ft === 1 && data.sid && typeof data.n === 'number') {
+                                if (!chunkGroups[data.sid]) {
+                                    chunkGroups[data.sid] = { u: Number(data.u) || 0, n: data.n, parts: {} };
+                                }
+                                chunkGroups[data.sid].parts[data.i] = data.d;
+                            } else if (data && data.balances && typeof data.updatedAt === 'number') {
+                                // Legacy single-message format
+                                if (!latestSinglePayload || data.updatedAt >= latestSinglePayload.updatedAt) {
+                                    latestSinglePayload = data;
+                                }
+                            }
+                        } else if (msg.attachment && msg.attachment.url) {
+                            attachmentMessages.push(msg);
+                        }
+                    } catch (_) {}
+                }
+
+                // Reconstruct complete chunked sessions
+                let latestChunkedPayload = null;
+                for (const sid of Object.keys(chunkGroups)) {
+                    const group = chunkGroups[sid];
+                    const keys = Object.keys(group.parts);
+                    if (keys.length === group.n) {
                         try {
-                            const msg = JSON.parse(line);
-                            if (msg.event === 'message' && msg.message) {
-                                const data = JSON.parse(msg.message);
-                                if (data && data.balances && typeof data.updatedAt === 'number') {
-                                    if (!latestPayload || data.updatedAt >= latestPayload.updatedAt) {
-                                        latestPayload = data;
-                                    }
+                            let fullJson = '';
+                            for (let i = 0; i < group.n; i++) {
+                                fullJson += group.parts[i];
+                            }
+                            const parsed = JSON.parse(fullJson);
+                            if (parsed && parsed.balances && typeof parsed.updatedAt === 'number') {
+                                if (!latestChunkedPayload || parsed.updatedAt >= latestChunkedPayload.updatedAt) {
+                                    latestChunkedPayload = parsed;
                                 }
                             }
                         } catch (_) {}
                     }
+                }
 
-                    if (latestPayload) {
-                        // Always accept newer state from cloud (including explicit 0 balance / empty transactions reset!)
-                        if (latestPayload.updatedAt >= (this.state.updatedAt || 0) || showNotification) {
-                            this.state = {
-                                balances: {
-                                    privat: Number(latestPayload.balances.privat) || 0,
-                                    universal: Number(latestPayload.balances.universal) || 0,
-                                    oschad: Number(latestPayload.balances.oschad) || 0
-                                },
-                                transactions: Array.isArray(latestPayload.transactions) ? latestPayload.transactions : [],
-                                updatedAt: latestPayload.updatedAt
-                            };
-                            this.saveLocalState();
-                            this.renderAll();
-                            if (showNotification) {
-                                this.showToast('Данные синхронизированы из облака', 'emerald');
+                // Fallback: if an attachment message exists from earlier >4KB push, try reading the latest one
+                if (!latestChunkedPayload && attachmentMessages.length > 0) {
+                    const lastAtt = attachmentMessages[attachmentMessages.length - 1];
+                    try {
+                        const attRes = await fetch(lastAtt.attachment.url, { cache: 'no-store' });
+                        if (attRes.ok) {
+                            const attData = await attRes.json();
+                            if (attData && attData.balances && typeof attData.updatedAt === 'number') {
+                                latestChunkedPayload = attData;
                             }
                         }
-                    } else if (showNotification) {
-                        // If cloud is empty, push current state
-                        await this.pushStateToCloud();
-                        this.showToast('Текущее состояние сохранено в облако', 'emerald');
+                    } catch (_) {}
+                }
+
+                if (latestChunkedPayload && latestSinglePayload) {
+                    return latestChunkedPayload.updatedAt >= latestSinglePayload.updatedAt
+                        ? latestChunkedPayload
+                        : latestSinglePayload;
+                }
+                return latestChunkedPayload || latestSinglePayload || null;
+            }
+
+            // Smart Sync: compares timestamps so clicking Sync on PC NEVER overwrites newer local data with older 0 UAH cloud data
+            async forceCloudPull(showNotification = false) {
+                this.setSyncIndicator('syncing');
+                try {
+                    const remotePayload = await this.fetchLatestCloudState();
+                    const localTime = Number(this.state.updatedAt) || 0;
+
+                    if (remotePayload) {
+                        const remoteTime = Number(remotePayload.updatedAt) || 0;
+
+                        if (remoteTime > localTime) {
+                            // Cloud has newer data -> Pull to this device
+                            this.applyIncomingState(remotePayload);
+                            if (showNotification) {
+                                this.showToast('Загружены более свежие данные из облака', 'emerald');
+                            }
+                        } else if (localTime > remoteTime) {
+                            // This device has newer data (e.g. just imported transactions) -> Push to cloud!
+                            await this.pushStateToCloud(false);
+                            if (showNotification) {
+                                this.showToast('Ваши свежие данные отправлены в облако', 'emerald');
+                            }
+                        } else if (showNotification) {
+                            this.showToast('Данные на устройстве и в облаке уже актуальны', 'emerald');
+                        }
+                    } else {
+                        // Cloud is empty -> Push local data if we have any
+                        if (localTime > 0 || this.state.transactions.length > 0) {
+                            await this.pushStateToCloud(false);
+                            if (showNotification) {
+                                this.showToast('Данные отправлены в облако', 'emerald');
+                            }
+                        } else if (showNotification) {
+                            this.showToast('Облако подключено (данных пока нет)', 'emerald');
+                        }
                     }
                     this.setSyncIndicator('online');
                 } catch (err) {
-                    console.warn('Cloud pull error:', err);
+                    console.warn('Smart sync error:', err);
                     this.setSyncIndicator('offline');
+                    if (showNotification) {
+                        this.showToast('Не удалось связаться с облаком', 'rose');
+                    }
                 }
             }
 
-            async pushStateToCloud() {
-                this.state.updatedAt = Date.now();
+            applyIncomingState(payload) {
+                this.state = {
+                    balances: {
+                        privat: Number(payload.balances?.privat) || 0,
+                        universal: Number(payload.balances?.universal) || 0,
+                        oschad: Number(payload.balances?.oschad) || 0
+                    },
+                    transactions: Array.isArray(payload.transactions) ? payload.transactions : [],
+                    updatedAt: Number(payload.updatedAt) || Date.now()
+                };
+                this.saveLocalState();
+                this.renderAll();
+            }
+
+            // Explicit Force Push button handler
+            async manualForcePush() {
+                await this.pushStateToCloud(true);
+                this.showToast('Данные с этого устройства принудительно отправлены в облако!', 'emerald');
+            }
+
+            // Explicit Force Pull button handler
+            async manualForcePull() {
+                this.setSyncIndicator('syncing');
+                try {
+                    const remotePayload = await this.fetchLatestCloudState();
+                    if (remotePayload) {
+                        this.applyIncomingState(remotePayload);
+                        this.setSyncIndicator('online');
+                        this.showToast('Данные из облака загружены на это устройство!', 'emerald');
+                    } else {
+                        this.setSyncIndicator('online');
+                        this.showToast('В облаке пока нет сохраненных данных по этому коду', 'rose');
+                    }
+                } catch (e) {
+                    this.setSyncIndicator('offline');
+                    this.showToast('Ошибка при загрузке из облака', 'rose');
+                }
+            }
+
+            // Push state to cloud using chunking (<2500 chars per message) so ntfy.sh never drops or turns large imports into attachments
+            async pushStateToCloud(bumpTimestamp = true) {
+                if (bumpTimestamp || !this.state.updatedAt) {
+                    this.state.updatedAt = Date.now();
+                }
                 this.saveLocalState();
                 const topic = this.getCloudTopicName();
                 this.setSyncIndicator('syncing');
+
                 try {
-                    await fetch(`https://ntfy.sh/${topic}`, {
-                        method: 'POST',
-                        body: JSON.stringify(this.state)
-                    });
+                    const serialized = JSON.stringify(this.state);
+                    const chunkSize = 2400;
+                    const totalChunks = Math.max(1, Math.ceil(serialized.length / chunkSize));
+                    const sid = 's_' + this.state.updatedAt + '_' + Math.random().toString(36).slice(2, 6);
+
+                    for (let i = 0; i < totalChunks; i++) {
+                        const slice = serialized.slice(i * chunkSize, (i + 1) * chunkSize);
+                        const envelope = JSON.stringify({
+                            _ft: 1,
+                            sid,
+                            u: this.state.updatedAt,
+                            i,
+                            n: totalChunks,
+                            d: slice
+                        });
+                        await fetch(`https://ntfy.sh/${topic}`, {
+                            method: 'POST',
+                            body: envelope
+                        });
+                    }
                     this.setSyncIndicator('online');
                 } catch (err) {
                     console.warn('Cloud push error:', err);
@@ -1389,25 +1536,32 @@
                     try { this.eventSource.close(); } catch (_) {}
                 }
                 const topic = this.getCloudTopicName();
+                this.liveChunks = {};
+
                 try {
                     this.eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
                     this.eventSource.onmessage = (event) => {
                         try {
                             const msg = JSON.parse(event.data);
                             if (msg.event === 'message' && msg.message) {
-                                const incoming = JSON.parse(msg.message);
-                                if (incoming && incoming.balances && incoming.updatedAt > (this.state.updatedAt || 0)) {
-                                    this.state = {
-                                        balances: {
-                                            privat: Number(incoming.balances.privat) || 0,
-                                            universal: Number(incoming.balances.universal) || 0,
-                                            oschad: Number(incoming.balances.oschad) || 0
-                                        },
-                                        transactions: Array.isArray(incoming.transactions) ? incoming.transactions : [],
-                                        updatedAt: incoming.updatedAt
-                                    };
-                                    this.saveLocalState();
-                                    this.renderAll();
+                                const data = JSON.parse(msg.message);
+                                if (data && data._ft === 1 && data.sid) {
+                                    if (!this.liveChunks[data.sid]) {
+                                        this.liveChunks[data.sid] = { n: data.n, parts: {} };
+                                    }
+                                    this.liveChunks[data.sid].parts[data.i] = data.d;
+                                    const group = this.liveChunks[data.sid];
+                                    if (Object.keys(group.parts).length === group.n) {
+                                        let full = '';
+                                        for (let i = 0; i < group.n; i++) full += group.parts[i];
+                                        const incoming = JSON.parse(full);
+                                        if (incoming && incoming.balances && incoming.updatedAt > (this.state.updatedAt || 0)) {
+                                            this.applyIncomingState(incoming);
+                                            this.setSyncIndicator('online');
+                                        }
+                                    }
+                                } else if (data && data.balances && data.updatedAt > (this.state.updatedAt || 0)) {
+                                    this.applyIncomingState(data);
                                     this.setSyncIndicator('online');
                                 }
                             }
@@ -2110,7 +2264,7 @@
             }
 
             // ==========================================
-            // STATEMENT PARSER (CSV / TXT / PASTE)
+            // STATEMENT PARSER (EXCEL .XLSX / CSV / PASTE)
             // ==========================================
             updateImportDefaultCard(val) {
                 this.importDefaultCard = val;
@@ -2119,41 +2273,306 @@
             handleStatementFileUpload(event) {
                 const file = event.target.files?.[0];
                 if (!file) return;
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    document.getElementById('import-raw-text').value = e.target.result || '';
-                    this.parseRawStatementText();
-                };
-                reader.readAsText(file, 'UTF-8');
+                const fileName = file.name.toLowerCase();
+
+                // Check if Excel file (.xlsx or .xls)
+                if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
+                    if (typeof XLSX === 'undefined') {
+                        this.showToast('Библиотека Excel ещё загружается, попробуйте через секунду', 'rose');
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        try {
+                            const data = new Uint8Array(e.target.result);
+                            const workbook = XLSX.read(data, { type: 'array' });
+                            let allRows = [];
+                            workbook.SheetNames.forEach(sheetName => {
+                                const sheet = workbook.Sheets[sheetName];
+                                const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' });
+                                if (Array.isArray(rows)) {
+                                    allRows = allRows.concat(rows);
+                                }
+                            });
+                            const candidates = this.parseStructuredRows(allRows);
+                            this.parsedImportCandidates = candidates;
+                            this.renderImportPreview();
+                            if (candidates.length > 0) {
+                                this.showToast(`Из Excel-выписки распознано операций: ${candidates.length}`, 'emerald');
+                            }
+                        } catch (err) {
+                            console.error('XLSX parse error:', err);
+                            this.showToast('Не удалось прочитать файл Excel', 'rose');
+                        }
+                    };
+                    reader.readAsArrayBuffer(file);
+                } else {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        document.getElementById('import-raw-text').value = e.target.result || '';
+                        this.parseRawStatementText();
+                    };
+                    reader.readAsText(file, 'UTF-8');
+                }
+                event.target.value = '';
             }
 
-            autoCategorizeMerchant(desc) {
-                const lower = desc.toLowerCase();
-                if (/атб|atb|сільпо|silpo|фора|varus|варус|auchan|ашан|metro|новус|novus|продукт|маркет/.test(lower)) {
+            // Map Privat24 / Oschad category & merchant description to app categories
+            autoCategorizeMerchant(desc, bankCategory = '') {
+                const combined = `${bankCategory} ${desc}`.toLowerCase();
+
+                if (/продукт|супермаркет|атб|atb|сільпо|silpo|фора|varus|варус|auchan|ашан|metro|новус|novus|маркет|thrash|траш/.test(combined)) {
                     return { category: 'groceries', priority: 'need' };
                 }
-                if (/steam|playstation|xbox|epic games|кіно|кино/.test(lower)) {
+                if (/розваг|ігри|игр|steam|playstation|xbox|epic games|кіно|кино|multiplex/.test(combined)) {
                     return { category: 'games', priority: 'want' };
                 }
-                if (/youtube|netflix|icloud|apple\.com\/bill|spotify|megogo|telegram|chatgpt|openai|google/.test(lower)) {
+                if (/підписк|подписк|цифрові товари|youtube|netflix|icloud|apple\.com\/bill|spotify|megogo|telegram|chatgpt|openai|google\s*\*|sweet\.tv/.test(combined)) {
                     return { category: 'subscriptions', priority: 'want' };
                 }
-                if (/kfc|mcdonald|макдональд|шаурма|кава|coffee|lviv croissants|puzata|пузата|суши|піца|пицца|glovo|bolt food/.test(lower)) {
+                if (/кафе|ресторан|фастфуд|kfc|mcdonald|макдональд|шаурма|кава|coffee|lviv croissants|puzata|пузата|суши|піца|пицца|glovo|bolt food/.test(combined)) {
                     return { category: 'cafe', priority: 'want' };
                 }
-                if (/uklon|uber|bolt|таксі|такси|окко|okko|wog|укрзалізниця|метро|проїзд/.test(lower)) {
+                if (/транспорт|таксі|такси|азс|палив|uklon|uber|bolt|окко|okko|wog|укрзалізниця|метро|проїзд/.test(combined)) {
                     return { category: 'transport', priority: 'need' };
                 }
-                if (/київстар|kyivstar|vodafone|lifecell|комунал|yasno|нафтогаз|інтернет|интернет|воля/.test(lower)) {
+                if (/комунал|інтернет|мобільн|зв'язок|київстар|kyivstar|vodafone|lifecell|yasno|нафтогаз|интернет|воля|укртелеком/.test(combined)) {
                     return { category: 'utilities', priority: 'need' };
                 }
-                if (/аптека|apteka|подорожник|анц|доброго дня|медиц/.test(lower)) {
+                if (/аптек|медиц|здоров|apteka|подорожник|анц|доброго дня|сінево|synevo/.test(combined)) {
                     return { category: 'health', priority: 'need' };
                 }
-                if (/аврора|avrora|rozetka|розетка|епіцентр|эпицентр|comfy|фокстрот|аліекспрес|aliexpress|eva|простор/.test(lower)) {
+                if (/одяг|взуття|покупк|шопінг|техніка|дім|ремонт|аврора|avrora|rozetka|розетка|епіцентр|эпицентр|comfy|фокстрот|аліекспрес|aliexpress|eva|простор|jysk|sinsay/.test(combined)) {
                     return { category: 'shopping', priority: 'want' };
                 }
                 return { category: 'other_exp', priority: 'need' };
+            }
+
+            // Helper: strip masked card numbers (e.g. 516874******1234 or 4149 49** **** 5678) so card BINs are NEVER mistaken for millions of UAH
+            stripMaskedCards(str) {
+                if (!str) return '';
+                return String(str)
+                    .replace(/\b\d{4,6}\s*[*•xXхХ]+\s*\d{2,4}\b/g, ' ')
+                    .replace(/\b\d{4}[\s-]*\d{2}[*•xXхХ]{2}[\s-]*[*•xXхХ]{4}[\s-]*\d{4}\b/g, ' ')
+                    .replace(/[*•xXхХ]{2,}\s*\d{4}\b/g, ' ')
+                    .replace(/\b\d{16}\b/g, ' ');
+            }
+
+            // Helper: check if a string cell is a masked card number
+            isMaskedCardCell(str) {
+                const s = String(str || '').trim();
+                return /^\d{4,6}\s*[*•xXхХ]+\s*\d{2,4}$/.test(s) ||
+                       /^[*•xXхХ]{2,}\s*\d{4}$/.test(s) ||
+                       /^\d{16}$/.test(s);
+            }
+
+            // Helper: extract YYYY-MM-DD from cell or string
+            extractIsoDate(str) {
+                const s = String(str || '').trim();
+                const dmy = s.match(/(\d{2})[./-](\d{2})[./-](\d{4})/);
+                if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+                const ymd = s.match(/(\d{4})[./-](\d{2})[./-](\d{2})/);
+                if (ymd) return `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+                return null;
+            }
+
+            // Helper: parse a single monetary cell (e.g. "- 1 245,50" or "-350.00 UAH")
+            parseMonetaryCell(cellValue) {
+                if (cellValue === null || cellValue === undefined) return null;
+                let s = String(cellValue).trim();
+                if (!s) return null;
+                if (this.isMaskedCardCell(s)) return null;
+                // Remove currency labels
+                s = s.replace(/\b(UAH|USD|EUR|ГРН)\b|₴/gi, '').trim();
+                // Must look like ONLY a signed/unsigned number with optional spaces and decimals
+                if (!/^[+-]?\s*\d[\d\s\u00A0]*([.,]\d{1,2})?$/.test(s)) return null;
+                const clean = s.replace(/[\s\u00A0]+/g, '').replace(',', '.');
+                const val = parseFloat(clean);
+                if (isNaN(val)) return null;
+                return val;
+            }
+
+            // Build candidate object from extracted fields
+            buildImportCandidate({ dateIso, signedVal, desc, bankCategory, defaultCard }) {
+                if (!dateIso || isNaN(signedVal) || signedVal === 0) return null;
+                const absAmount = Math.abs(signedVal);
+                // Sanity guard against corrupted card numbers
+                if (absAmount > 2500000) return null;
+
+                const cleanDesc = this.stripMaskedCards(desc)
+                    .replace(/\s+/g, ' ')
+                    .trim() || bankCategory || 'Операция из выписки';
+
+                const combinedText = `${bankCategory || ''} ${cleanDesc}`;
+                const isTransferUniversal = /універсальн|универсальн/i.test(combinedText) && /переказ|перевод|поповнення|свою картку/i.test(combinedText);
+                const isIncome = signedVal > 0;
+
+                const isDuplicate = this.state.transactions.some(t =>
+                    t.date === dateIso && Math.abs((Number(t.amount) || 0) - absAmount) < 0.01
+                );
+
+                if (isTransferUniversal) {
+                    return {
+                        selected: !isDuplicate,
+                        isDuplicate,
+                        type: 'transfer',
+                        fromCard: defaultCard === 'universal' ? 'privat' : defaultCard,
+                        toCard: 'universal',
+                        amount: absAmount,
+                        date: dateIso,
+                        note: cleanDesc,
+                        category: 'other_exp',
+                        priority: 'need'
+                    };
+                } else if (isIncome) {
+                    return {
+                        selected: !isDuplicate,
+                        isDuplicate,
+                        type: 'income',
+                        card: defaultCard,
+                        amount: absAmount,
+                        date: dateIso,
+                        note: cleanDesc,
+                        category: 'salary',
+                        priority: 'need'
+                    };
+                } else {
+                    const auto = this.autoCategorizeMerchant(cleanDesc, bankCategory);
+                    return {
+                        selected: !isDuplicate,
+                        isDuplicate,
+                        type: 'expense',
+                        card: defaultCard,
+                        amount: absAmount,
+                        date: dateIso,
+                        note: cleanDesc,
+                        category: auto.category,
+                        priority: auto.priority
+                    };
+                }
+            }
+
+            // Parse 2D array of rows (from SheetJS .xlsx OR tab-separated copy-paste from Excel)
+            parseStructuredRows(rows) {
+                const defaultCard = document.getElementById('import-default-card')?.value || 'privat';
+                const parsed = [];
+
+                // 1. Try to locate Privat24 / Oschad header row
+                let headerRowIdx = -1;
+                const colMap = {
+                    date: -1,
+                    time: -1,
+                    category: -1,
+                    card: -1,
+                    desc: -1,
+                    amountCard: -1,
+                    balance: -1
+                };
+
+                for (let r = 0; r < Math.min(rows.length, 25); r++) {
+                    const row = rows[r];
+                    if (!Array.isArray(row) || row.length < 3) continue;
+                    const lowerCells = row.map(c => String(c || '').trim().toLowerCase());
+                    const hasDate = lowerCells.some(c => c === 'дата' || c.includes('дата операції') || c === 'date');
+                    const hasSum = lowerCells.some(c => c.includes('сума') || c.includes('сумма') || c === 'amount');
+
+                    if (hasDate && hasSum) {
+                        headerRowIdx = r;
+                        lowerCells.forEach((cell, idx) => {
+                            if (colMap.date === -1 && (cell === 'дата' || cell.includes('дата'))) colMap.date = idx;
+                            else if (colMap.time === -1 && (cell === 'час' || cell === 'время')) colMap.time = idx;
+                            else if (colMap.category === -1 && cell.includes('категор')) colMap.category = idx;
+                            else if (colMap.card === -1 && (cell.includes('картк') || cell.includes('карта'))) colMap.card = idx;
+                            else if (colMap.desc === -1 && (cell.includes('опис') || cell.includes('призначення') || cell.includes('описание') || cell.includes('детал'))) colMap.desc = idx;
+                            else if (cell.includes('сума в валюті картки') || cell.includes('сумма в валюте карты')) colMap.amountCard = idx;
+                            else if (colMap.amountCard === -1 && (cell.includes('сума') || cell.includes('сумма'))) colMap.amountCard = idx;
+                            else if (colMap.balance === -1 && (cell.includes('залишок') || cell.includes('остаток'))) colMap.balance = idx;
+                        });
+                        break;
+                    }
+                }
+
+                // 2. Process rows using detected header map OR intelligent column classification
+                const startRow = headerRowIdx !== -1 ? headerRowIdx + 1 : 0;
+
+                for (let r = startRow; r < rows.length; r++) {
+                    const row = rows[r];
+                    if (!Array.isArray(row) || row.length === 0) continue;
+
+                    if (headerRowIdx !== -1 && colMap.date !== -1 && colMap.amountCard !== -1) {
+                        const dateIso = this.extractIsoDate(row[colMap.date]);
+                        if (!dateIso) continue; // Skips footer/summary rows!
+
+                        const signedVal = this.parseMonetaryCell(row[colMap.amountCard]);
+                        if (signedVal === null || signedVal === 0) continue;
+
+                        const desc = colMap.desc !== -1 ? String(row[colMap.desc] || '') : '';
+                        const bankCategory = colMap.category !== -1 ? String(row[colMap.category] || '') : '';
+
+                        const candidate = this.buildImportCandidate({
+                            dateIso,
+                            signedVal,
+                            desc,
+                            bankCategory,
+                            defaultCard
+                        });
+                        if (candidate) parsed.push(candidate);
+                    } else {
+                        // Headerless row (e.g. user selected cells in Excel and copied without header)
+                        let dateIso = null;
+                        const moneyValues = [];
+                        const textParts = [];
+
+                        for (let c = 0; c < row.length; c++) {
+                            const rawCell = String(row[c] ?? '').trim();
+                            if (!rawCell) continue;
+
+                            // Skip time cells
+                            if (/^\d{2}:\d{2}(:\d{2})?$/.test(rawCell)) continue;
+                            // Skip masked card cells (prevents 516874******1234 from ever being parsed as money!)
+                            if (this.isMaskedCardCell(rawCell)) continue;
+                            // Skip pure currency code cells
+                            if (/^(UAH|USD|EUR|ГРН|₴)$/i.test(rawCell)) continue;
+
+                            if (!dateIso) {
+                                const maybeDate = this.extractIsoDate(rawCell);
+                                if (maybeDate && rawCell.length <= 22) {
+                                    dateIso = maybeDate;
+                                    continue;
+                                }
+                            }
+
+                            const maybeMoney = this.parseMonetaryCell(rawCell);
+                            if (maybeMoney !== null) {
+                                moneyValues.push(maybeMoney);
+                                continue;
+                            }
+
+                            textParts.push(rawCell);
+                        }
+
+                        if (!dateIso || moneyValues.length === 0) continue;
+
+                        // In Privat24 rows: [Сума в валюті картки, Сума в валюті транзакції, Залишок на кінець періоду]
+                        // Always take the FIRST monetary column (amount in card currency) and ignore trailing balance!
+                        const signedVal = moneyValues[0];
+                        if (signedVal === 0) continue;
+
+                        const bankCategory = textParts.length > 1 ? textParts[0] : '';
+                        const desc = textParts.length > 1 ? textParts.slice(1).join(' — ') : (textParts[0] || '');
+
+                        const candidate = this.buildImportCandidate({
+                            dateIso,
+                            signedVal,
+                            desc,
+                            bankCategory,
+                            defaultCard
+                        });
+                        if (candidate) parsed.push(candidate);
+                    }
+                }
+
+                return parsed;
             }
 
             parseRawStatementText() {
@@ -2163,89 +2582,66 @@
                     return;
                 }
 
-                const defaultCard = document.getElementById('import-default-card').value || 'privat';
                 const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+                // If lines contain Tab (\t) from Excel copy-paste or semicolon (;), use structured row parser!
+                const multiColLines = lines.filter(l => l.includes('\t') || (l.split(';').length >= 4));
+                if (multiColLines.length > 0) {
+                    const rows = lines.map(line => {
+                        if (line.includes('\t')) return line.split('\t');
+                        if (line.split(';').length >= 4) return line.split(';');
+                        return [line];
+                    });
+                    const structuredCandidates = this.parseStructuredRows(rows);
+                    if (structuredCandidates.length > 0) {
+                        this.parsedImportCandidates = structuredCandidates;
+                        this.renderImportPreview();
+                        return;
+                    }
+                }
+
+                // Fallback: single-string freeform line parser (with full masked card protection)
+                const defaultCard = document.getElementById('import-default-card').value || 'privat';
                 const parsed = [];
 
                 for (const line of lines) {
-                    // Skip header lines
-                    if (/^(дата|date|картка|сума|опис)/i.test(line)) continue;
+                    if (/^(дата|date|картка|сума|опис|виписка|період|разом|всього)/i.test(line)) continue;
 
-                    // Extract date (DD.MM.YYYY or YYYY-MM-DD)
-                    let dateIso = new Date().toISOString().slice(0, 10);
-                    const dmyMatch = line.match(/(\d{2})[./-](\d{2})[./-](\d{4})/);
-                    const ymdMatch = line.match(/(\d{4})-(\d{2})-(\d{2})/);
-                    if (dmyMatch) {
-                        dateIso = `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
-                    } else if (ymdMatch) {
-                        dateIso = `${ymdMatch[1]}-${ymdMatch[2]}-${ymdMatch[3]}`;
+                    const dateIso = this.extractIsoDate(line);
+                    if (!dateIso) continue; // Only parse lines with an explicit transaction date
+
+                    // Strip masked cards, dates, and times FIRST
+                    const cleanedLine = this.stripMaskedCards(line)
+                        .replace(/\d{2}[./-]\d{2}[./-]\d{4}/g, ' ')
+                        .replace(/\d{4}[./-]\d{2}[./-]\d{2}/g, ' ')
+                        .replace(/\b\d{2}:\d{2}(:\d{2})?\b/g, ' ');
+
+                    // Prefer decimal amounts (e.g. -345.50 or -1 200,00) so store numbers aren't matched
+                    let amountMatches = [...cleanedLine.matchAll(/([+-]?\s*\d[\d\s\u00A0]*[.,]\d{2})\b/g)];
+                    if (amountMatches.length === 0) {
+                        amountMatches = [...cleanedLine.matchAll(/([+-]\s*\d[\d\s\u00A0]*)\b/g)];
                     }
-
-                    // Extract amount (looking for signed float or currency amount)
-                    const cleanedLine = line.replace(/\d{2}[./-]\d{2}[./-]\d{4}/g, '').replace(/\d{4}-\d{2}-\d{2}/g, '').replace(/\d{2}:\d{2}(:\d{2})?/g, '');
-                    const amountMatches = [...cleanedLine.matchAll(/([+-]?\s*\d[\d\s]*[.,]\d{2}|[+-]\s*\d+)/g)];
                     if (amountMatches.length === 0) continue;
 
-                    const rawAmtStr = amountMatches[0][0].replace(/\s+/g, '').replace(',', '.');
+                    // Pick the first monetary match (amount in card currency, ignoring trailing card balance at the end of the line)
+                    const rawAmtStr = amountMatches[0][1].replace(/[\s\u00A0]+/g, '').replace(',', '.');
                     const signedVal = parseFloat(rawAmtStr);
                     if (isNaN(signedVal) || signedVal === 0) continue;
 
-                    // Clean description
-                    let desc = cleanedLine
-                        .replace(amountMatches[0][0], '')
-                        .replace(/;|,|\t|UAH|грн|₴/gi, ' ')
-                        .replace(/\s+/g, ' ')
-                        .trim();
-                    if (!desc) desc = 'Операция из выписки';
+                    let desc = cleanedLine;
+                    amountMatches.forEach(m => {
+                        desc = desc.replace(m[0], ' ');
+                    });
+                    desc = desc.replace(/;|,|\t|UAH|USD|EUR|грн|₴/gi, ' ').replace(/\s+/g, ' ').trim();
 
-                    const isTransferUniversal = /універсальн|универсальн/i.test(desc) && /переказ|перевод|поповнення/i.test(desc);
-                    const isIncome = signedVal > 0 && (/зарплат|зарахування|виплат|аванс|поповнення|\+/i.test(line));
-                    const absAmount = Math.abs(signedVal);
-
-                    // Check duplicate
-                    const isDuplicate = this.state.transactions.some(t =>
-                        t.date === dateIso && Math.abs((Number(t.amount) || 0) - absAmount) < 0.01
-                    );
-
-                    if (isTransferUniversal) {
-                        parsed.push({
-                            selected: !isDuplicate,
-                            isDuplicate,
-                            type: 'transfer',
-                            fromCard: defaultCard === 'universal' ? 'privat' : defaultCard,
-                            toCard: 'universal',
-                            amount: absAmount,
-                            date: dateIso,
-                            note: desc,
-                            category: 'other_exp',
-                            priority: 'need'
-                        });
-                    } else if (isIncome) {
-                        parsed.push({
-                            selected: !isDuplicate,
-                            isDuplicate,
-                            type: 'income',
-                            card: defaultCard,
-                            amount: absAmount,
-                            date: dateIso,
-                            note: desc,
-                            category: 'salary',
-                            priority: 'need'
-                        });
-                    } else {
-                        const auto = this.autoCategorizeMerchant(desc);
-                        parsed.push({
-                            selected: !isDuplicate,
-                            isDuplicate,
-                            type: 'expense',
-                            card: defaultCard,
-                            amount: absAmount,
-                            date: dateIso,
-                            note: desc,
-                            category: auto.category,
-                            priority: auto.priority
-                        });
-                    }
+                    const candidate = this.buildImportCandidate({
+                        dateIso,
+                        signedVal,
+                        desc,
+                        bankCategory: '',
+                        defaultCard
+                    });
+                    if (candidate) parsed.push(candidate);
                 }
 
                 this.parsedImportCandidates = parsed;
@@ -2261,11 +2657,40 @@
                 const container = document.getElementById('import-preview-container');
                 if (this.parsedImportCandidates.length === 0) {
                     container.classList.add('hidden');
-                    this.showToast('Не удалось распознать строки', 'rose');
+                    this.showToast('Не удалось распознать операции. Проверьте формат выписки.', 'rose');
                     return;
                 }
                 container.classList.remove('hidden');
-                document.getElementById('import-preview-count-badge').textContent = `${this.parsedImportCandidates.length} шт.`;
+
+                const selectedItems = this.parsedImportCandidates.filter(c => c.selected);
+                const totalExp = selectedItems.filter(c => c.type === 'expense').reduce((s, c) => s + c.amount, 0);
+                const totalInc = selectedItems.filter(c => c.type === 'income').reduce((s, c) => s + c.amount, 0);
+                const totalTrf = selectedItems.filter(c => c.type === 'transfer').reduce((s, c) => s + c.amount, 0);
+
+                document.getElementById('import-preview-count-badge').textContent = `Выбрано: ${selectedItems.length} из ${this.parsedImportCandidates.length}`;
+
+                // Populate Summary Strip so user can immediately verify exact totals before importing
+                const summaryEl = document.getElementById('import-preview-summary');
+                if (summaryEl) {
+                    summaryEl.innerHTML = `
+                        <div class="p-3 rounded-2xl bg-slate-900/90 border border-white/10">
+                            <span class="text-[11px] text-slate-400 block">Выбрано операций</span>
+                            <span class="text-sm sm:text-base font-extrabold text-white mt-0.5 block">${selectedItems.length} шт.</span>
+                        </div>
+                        <div class="p-3 rounded-2xl bg-rose-500/10 border border-rose-500/20">
+                            <span class="text-[11px] text-rose-300 block">Сумма расходов</span>
+                            <span class="text-sm sm:text-base font-extrabold text-rose-400 mt-0.5 block">-${this.formatMoney(totalExp)}</span>
+                        </div>
+                        <div class="p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/20">
+                            <span class="text-[11px] text-emerald-300 block">Сумма доходов</span>
+                            <span class="text-sm sm:text-base font-extrabold text-emerald-400 mt-0.5 block">+${this.formatMoney(totalInc)}</span>
+                        </div>
+                        <div class="p-3 rounded-2xl bg-teal-500/10 border border-teal-500/20">
+                            <span class="text-[11px] text-teal-300 block">Переводы между своими</span>
+                            <span class="text-sm sm:text-base font-extrabold text-teal-300 mt-0.5 block">${this.formatMoney(totalTrf)}</span>
+                        </div>
+                    `;
+                }
 
                 const rowsEl = document.getElementById('import-preview-rows');
                 rowsEl.innerHTML = this.parsedImportCandidates.map((item, idx) => {
@@ -2276,7 +2701,7 @@
                                 <input type="checkbox" ${item.selected ? 'checked' : ''} onchange="window.app.toggleImportCandidate(${idx}, this.checked)" class="w-4 h-4 accent-emerald-500 rounded cursor-pointer shrink-0">
                                 <div class="min-w-0">
                                     <p class="text-xs sm:text-sm font-bold text-white truncate">${item.note}</p>
-                                    <p class="text-[11px] text-slate-400">${item.date} • ${cat.icon} ${cat.name} ${item.isDuplicate ? '• (Уже есть)' : ''}</p>
+                                    <p class="text-[11px] text-slate-400">${item.date} • ${cat.icon} ${cat.name} ${item.isDuplicate ? '• (Уже есть в истории)' : ''}</p>
                                 </div>
                             </div>
                             <span class="text-xs sm:text-sm font-extrabold shrink-0 ${item.type === 'income' ? 'text-emerald-400' : item.type === 'transfer' ? 'text-teal-300' : 'text-rose-400'}">
